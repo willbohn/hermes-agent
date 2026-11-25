@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import platform
-import select
 import shlex
 import signal
 import stat
@@ -26,6 +25,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 # (not merely "not Windows") so macOS and other POSIX platforms never touch systemd.
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
+from tools.environments.fd_wait import open_fd_waiter
 from tools.environments.sandbox_scope import hosted_scope, producer_fields
 from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env, routed_terminal_base
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -60,7 +60,6 @@ MAX_OUTPUT_CHARS = 200_000      # rolling output buffer
 COMPLETION_OUTPUT_CHARS = 2000
 FINISHED_TTL_SECONDS = 1800     # keep finished processes 30 minutes
 MAX_PROCESSES = 64              # max tracked processes (LRU pruning)
-_PTY_READER_POLL_SECONDS = 0.5  # bounded PTY read poll (#132358)
 
 # Watch-pattern rate limiting, PER SESSION: one watch-match notification per
 # WATCH_MIN_INTERVAL_SECONDS; a match inside the cooldown is dropped and counts as one
@@ -1465,63 +1464,56 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 return
 
     def _pty_reader_loop(self, session: ProcessSession):
-        """Background thread: read output from a PTY process."""
+        """Drain queued POSIX PTY output after child exit without waiting for inherited slaves."""
         pty = session._pty
-        # Same split-multibyte handling as _reader_loop.
-        # PTY reads can split a multibyte UTF-8 character across chunks just like pipe reads — hold partial
-        # sequences until the rest arrives. (Ported from openclaw/openclaw#112325.)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        # Programs in a PTY can block waiting for replies to device-status / window-size /
-        # cursor-position / DEC private-mode queries. Answer the bounded set and strip the
-        # queries from captured output. POSIX only: Windows ConPTY is a real console host that
-        # answers itself (and pywinpty yields str chunks, not bytes).
+        # ConPTY answers terminal queries itself and returns text, not bytes.
         responder = None
         if not _IS_WINDOWS:
             from tools.pty_query_responder import PtyQueryResponder
             responder = PtyQueryResponder(rows=30, cols=120)
 
         def ingest(text: str) -> None:
-            # A kill can leave this reader running while a detached descendant holds the
-            # slave open (_release_finished_handles defers the close to it). Keep draining,
-            # but leave the killed session's output as the kill reported it.
+            # A kill may already have published its final output.
             self._ingest_output(session, text, unless_exited=True)
 
+        waiter, drained = None, 0
         try:
-            while pty.isalive():
-                try:
-                    fd = None if _IS_WINDOWS else getattr(pty, "fd", None)
-                    if fd is not None and fd >= 0:
-                        # A descendant that setsid()s past the kill keeps the slave open, so a
-                        # blocking read below would never return while it holds the file
-                        # object's buffer lock — the reader (and the master fd it closes)
-                        # would stay leaked for the escapee's whole lifetime (#132358). Poll
-                        # with a timeout so the loop re-checks isalive() once the child is dead.
-                        ready, _, _ = select.select(
-                            [fd], [], [], _PTY_READER_POLL_SECONDS)
-                        if not ready:
-                            continue
-                    chunk = pty.read(4096)
-                    if chunk:
-                        # ptyprocess returns bytes; pywinpty returns str
-                        if responder is not None and isinstance(chunk, bytes):
-                            chunk, replies = responder.process(chunk)
-                            if replies:
-                                try:
-                                    pty.write(replies)
-                                except Exception:
-                                    logger.debug(
-                                        "PTY query response write failed",
-                                        exc_info=True,
-                                    )
-                        text = chunk if isinstance(chunk, str) else decoder.decode(chunk)
-                        if text:
-                            ingest(text)
-                except Exception:  # EOFError included
+            fd = None if _IS_WINDOWS else getattr(pty, "fd", None)
+            if isinstance(fd, int) and fd >= 0:
+                waiter = open_fd_waiter(fd)
+            while not _IS_WINDOWS or pty.isalive():
+                if session.exited:
                     break
+                alive = pty.isalive() if waiter is not None else True
+                # Exit is not EOF. Read the queued tail, but never await a descendant's future writes.
+                if waiter is not None and not waiter.wait(0.5 if alive else 0):
+                    if not alive:
+                        break
+                    continue
+                chunk = pty.read(4096)
+                drained += len(chunk) if not alive else 0
+                if responder is not None and isinstance(chunk, bytes):
+                    chunk, replies = responder.process(chunk)
+                    if replies and alive:
+                        try:
+                            pty.write(replies)
+                        except Exception:
+                            logger.debug("PTY query response write failed", exc_info=True)
+                text = chunk if isinstance(chunk, str) else decoder.decode(chunk)
+                if text:
+                    ingest(text)
+                # Count raw bytes, including stripped queries, so a busy orphan cannot keep us here.
+                if drained >= _FINAL_DRAIN_MAX_CHARS:
+                    break
+        except EOFError:
+            pass
         except Exception as e:
             logger.debug("PTY stdout reader ended: %s", e)
+        finally:
+            if waiter is not None:
+                waiter.close()
         if responder is not None:
-            # A query prefix split across the final reads is plain output after all.
             tail = decoder.decode(responder.flush())
             if tail:
                 ingest(tail)
@@ -1628,13 +1620,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
                         stream.close()
         if session._pty is not None:
-            # A live ptyprocess reader sits in a blocking read holding the PTY file
-            # object's buffer lock, and that read only ends once every holder of
-            # the slave side is gone. A descendant that setsid()s past the kill
-            # keeps it open, so close() here would block forever (under _lock on
-            # the prune path). The reader closes the PTY itself via
-            # _finish_reader once its read ends. pywinpty reads don't block, so
-            # Windows closes here as before.
+            # The POSIX reader owns the master until its bounded drain ends. Never race
+            # close() against its buffered read; the reader's own teardown closes it.
             reader = session._reader_thread
             if (not _IS_WINDOWS and reader is not None and reader.is_alive()
                     and reader is not threading.current_thread()):
