@@ -18,7 +18,6 @@ import pytest
 import tools.process_registry as module
 from tools.process_registry import ProcessRegistry
 
-_POSIX = pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY")
 _POSIX_PTY = pytest.mark.skipif(
     sys.platform == "win32" or shutil.which("setsid") is None, reason="POSIX PTY + setsid")
 
@@ -162,7 +161,7 @@ def test_chunk_read_before_the_kill_is_not_added_after_it(tmp_path, unscoped):
     assert not any("RACE-MARKER" in text for text in emitted)
 
 
-@_POSIX
+@pytest.mark.platforms("posix")
 def test_kill_reclaims_the_reader_without_waiting_out_the_escapee(tmp_path, unscoped):
     """The reader polls its read, so once the kill lands it notices the dead child and closes
     the PTY itself — instead of staying blocked (holding the master fd) until a long-lived
